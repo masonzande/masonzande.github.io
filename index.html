@@ -47,22 +47,31 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const MINS = 10;
+const params = new URLSearchParams(location.search);
+const MINS = +params.get('mins') || 10;
 
 let me, room, peer;
-const conns = {};              // seat -> DataConnection
-let rem = [0, 0, 0, 0];        // remaining ms per seat (as of `last`)
-let active = -1;               // whose turn; -1 = not started
-let last = 0;                  // local time when active turn began
+const conns = {};            // slot -> DataConnection (networking only)
+let order = [];              // slots in clockwise move order, built by claim taps
+let rem = [0, 0, 0, 0];      // remaining ms, indexed by slot
+let active = -1;             // slot whose turn it is; -1 = not started
+let last = 0;
 let over = false;
 
-// ---------- networking (full mesh) ----------
+if (params.get('room')) $('room').value = params.get('room');
+$('start').textContent = `Start (${MINS} min each)`;
+
+// ---------- networking (full mesh, first free slot) ----------
 $('join').onclick = () => {
   room = $('room').value.trim().toLowerCase();
-  if (!room) return;
-  me = +$('seat').value;
-  peer = new Peer(`chessclock-${room}-${me}`);
+  if (room) tryJoin(0);
+};
+if (params.get('room')) window.addEventListener('load', () => $('join').click());
 
+function tryJoin(slot) {
+  if (slot > 3) { alert('Room is full.'); return; }
+  me = slot;
+  peer = new Peer(`chessclock-${room}-${me}`);
   peer.on('open', () => {
     $('setup').style.display = 'none';
     $('game').style.display = 'flex';
@@ -70,55 +79,59 @@ $('join').onclick = () => {
   });
   peer.on('connection', c => setup(c, +c.peer.slice(-1)));
   peer.on('error', e => {
-    if (e.type === 'unavailable-id') { alert('That seat is already taken.'); location.reload(); }
-    // 'peer-unavailable' just means that seat hasn't joined yet; they'll dial us
+    if (e.type === 'unavailable-id') { peer.destroy(); tryJoin(slot + 1); }
   });
-};
+}
 
-function setup(c, seat) {
-  c.on('open', () => { conns[seat] = c; render(); });
+function setup(c, slot) {
+  c.on('open', () => { conns[slot] = c; });
   c.on('data', onMsg);
-  c.on('close', () => { delete conns[seat]; render(); });
+  c.on('close', () => { delete conns[slot]; });
 }
 
 function broadcast(m) { Object.values(conns).forEach(c => c.open && c.send(m)); }
 
 // ---------- game logic ----------
-// Each phone owns its own clock: when you tap, you send YOUR remaining time.
-// Everyone else just counts down the active player locally from that value.
 function onMsg(m) {
+  if (m.t === 'claim' && !order.includes(m.slot)) order.push(m.slot);
   if (m.t === 'start') applyStart(m.ms);
-  if (m.t === 'tap')   applyTap(m.seat, m.rem);
-  if (m.t === 'flag')  { rem[m.seat] = 0; over = true; }
+  if (m.t === 'tap')   applyTap(m.slot, m.rem);
+  if (m.t === 'flag')  { rem[m.slot] = 0; over = true; }
 }
 
 function applyStart(ms) {
-  rem = [ms, ms, ms, ms]; active = 0; last = performance.now(); over = false;
+  rem = [ms, ms, ms, ms]; active = order[0]; last = performance.now(); over = false;
 }
 
-function applyTap(seat, remaining) {
-  rem[seat] = remaining;
-  active = (seat + 1) % 4;
+function applyTap(slot, remaining) {
+  rem[slot] = remaining;
+  active = order[(order.indexOf(slot) + 1) % 4];   // clockwise
   last = performance.now();
 }
 
+$('claim').onclick = () => {
+  if (order.includes(me)) return;
+  order.push(me);
+  broadcast({ t: 'claim', slot: me });
+};
+
 $('start').onclick = () => {
-  const ms = MINS * 60 * 1000;
+  const ms = MINS * 60000;
   broadcast({ t: 'start', ms });
   applyStart(ms);
 };
 
 $('tap').onclick = () => {
-  if (active !== me || over) return;       // lockout
+  if (active !== me || over) return;               // lockout
   const remaining = rem[me] - (performance.now() - last);
-  broadcast({ t: 'tap', seat: me, rem: remaining });
+  broadcast({ t: 'tap', slot: me, rem: remaining });
   applyTap(me, remaining);
   if (navigator.vibrate) navigator.vibrate(30);
 };
 
 // ---------- display ----------
-function current(i) {
-  const t = (i === active && !over) ? rem[i] - (performance.now() - last) : rem[i];
+function current(slot) {
+  const t = (slot === active && !over) ? rem[slot] - (performance.now() - last) : rem[slot];
   return Math.max(0, t);
 }
 
@@ -128,25 +141,37 @@ function fmt(ms) {
 }
 
 function render() {
-  // flag detection: only the owner of the clock declares it
   if (active === me && !over && current(me) <= 0) {
-    over = true; rem[me] = 0; broadcast({ t: 'flag', seat: me });
+    over = true; rem[me] = 0; broadcast({ t: 'flag', slot: me });
   }
 
-  $('clocks').innerHTML = [0, 1, 2, 3].map(i =>
-    `<div class="clock ${i === active ? 'active' : ''} ${i === me ? 'me' : ''}">
-       <div class="name">Seat ${i + 1}${i === me ? ' (you)' : ''}</div>
-       <div class="time">${active < 0 ? fmt(MINS * 60000) : fmt(current(i))}</div>
-     </div>`).join('');
+  const started = active >= 0;
+  $('clocks').innerHTML = [0, 1, 2, 3].map(p => {
+    const slot = order[p];
+    if (slot === undefined) return `<div class="clock"><div class="name">Seat ${p + 1}</div><div class="time">—</div></div>`;
+    return `<div class="clock ${slot === active ? 'active' : ''} ${slot === me ? 'me' : ''}">
+      <div class="name">Seat ${p + 1}${slot === me ? ' (you)' : ''}</div>
+      <div class="time">${started ? fmt(current(slot)) : fmt(MINS * 60000)}</div></div>`;
+  }).join('');
 
-  $('peers').textContent = `Connected: ${Object.keys(conns).length}/3`;
-  $('start').style.display = active < 0 ? 'block' : 'none';
+  const connected = Object.keys(conns).length;
+  $('peers').textContent = `Connected: ${connected}/3`;
+
+  // claim phase
+  const claimed = order.includes(me);
+  $('claim').style.display = (!started && !claimed) ? 'block' : 'none';
+  $('claim').textContent = `I'm seat ${order.length + 1} (clockwise)`;
+
+  $('start').style.display = started ? 'none' : 'block';
+  $('start').disabled = !(order.length === 4 && connected === 3);
 
   const t = $('tap');
   const myTurn = active === me && !over;
   t.disabled = !myTurn;
   t.classList.toggle('mine', myTurn);
-  t.textContent = over ? 'Game over' : active < 0 ? 'Waiting to start…' : myTurn ? 'TAP' : `Seat ${active + 1}'s turn`;
+  t.textContent = over ? 'Game over'
+    : !started ? (order.length < 4 ? 'Claim seats clockwise…' : 'Ready to start')
+    : myTurn ? 'TAP' : `Seat ${order.indexOf(active) + 1}'s turn`;
 }
 
 setInterval(() => { if (me !== undefined) render(); }, 100);
