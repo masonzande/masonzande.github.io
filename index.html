@@ -1,0 +1,155 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>4-Player Chess Clock</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee;
+         height: 100dvh; display: flex; flex-direction: column; }
+  #setup { padding: 24px; display: flex; flex-direction: column; gap: 12px; max-width: 420px; margin: auto; width: 100%; }
+  input, select, button { font-size: 18px; padding: 12px; border-radius: 8px; border: 0; }
+  button { background: #3b82f6; color: #fff; }
+  #game { display: none; flex: 1; flex-direction: column; }
+  #status { padding: 8px 12px; font-size: 14px; background: #222; display: flex; justify-content: space-between; }
+  #clocks { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 8px; }
+  .clock { background: #222; border-radius: 10px; padding: 12px; text-align: center; border: 3px solid transparent; }
+  .clock.active { border-color: #22c55e; background: #14301f; }
+  .clock.me .name { color: #60a5fa; }
+  .name { font-size: 14px; opacity: .8; }
+  .time { font-size: 34px; font-variant-numeric: tabular-nums; }
+  #tap { flex: 1; margin: 8px; font-size: 32px; border-radius: 16px; }
+  #tap:disabled { background: #333; color: #777; }
+  #tap.mine { background: #22c55e; }
+  #start { margin: 8px; }
+</style>
+</head>
+<body>
+
+<div id="setup">
+  <h2>4-Player Chess Clock</h2>
+  <input id="room" placeholder="Room code (same on all phones)" autocapitalize="off">
+  <select id="seat">
+    <option value="0">Seat 1</option><option value="1">Seat 2</option>
+    <option value="2">Seat 3</option><option value="3">Seat 4</option>
+  </select>
+  <button id="join">Join</button>
+</div>
+
+<div id="game">
+  <div id="status"><span id="peers"></span><span id="msg"></span></div>
+  <div id="clocks"></div>
+  <button id="start">Start (10 min each)</button>
+  <button id="tap" disabled>Waiting…</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const MINS = 10;
+
+let me, room, peer;
+const conns = {};              // seat -> DataConnection
+let rem = [0, 0, 0, 0];        // remaining ms per seat (as of `last`)
+let active = -1;               // whose turn; -1 = not started
+let last = 0;                  // local time when active turn began
+let over = false;
+
+// ---------- networking (full mesh) ----------
+$('join').onclick = () => {
+  room = $('room').value.trim().toLowerCase();
+  if (!room) return;
+  me = +$('seat').value;
+  peer = new Peer(`chessclock-${room}-${me}`);
+
+  peer.on('open', () => {
+    $('setup').style.display = 'none';
+    $('game').style.display = 'flex';
+    for (let s = 0; s < 4; s++) if (s !== me) setup(peer.connect(`chessclock-${room}-${s}`), s);
+  });
+  peer.on('connection', c => setup(c, +c.peer.slice(-1)));
+  peer.on('error', e => {
+    if (e.type === 'unavailable-id') { alert('That seat is already taken.'); location.reload(); }
+    // 'peer-unavailable' just means that seat hasn't joined yet; they'll dial us
+  });
+};
+
+function setup(c, seat) {
+  c.on('open', () => { conns[seat] = c; render(); });
+  c.on('data', onMsg);
+  c.on('close', () => { delete conns[seat]; render(); });
+}
+
+function broadcast(m) { Object.values(conns).forEach(c => c.open && c.send(m)); }
+
+// ---------- game logic ----------
+// Each phone owns its own clock: when you tap, you send YOUR remaining time.
+// Everyone else just counts down the active player locally from that value.
+function onMsg(m) {
+  if (m.t === 'start') applyStart(m.ms);
+  if (m.t === 'tap')   applyTap(m.seat, m.rem);
+  if (m.t === 'flag')  { rem[m.seat] = 0; over = true; }
+}
+
+function applyStart(ms) {
+  rem = [ms, ms, ms, ms]; active = 0; last = performance.now(); over = false;
+}
+
+function applyTap(seat, remaining) {
+  rem[seat] = remaining;
+  active = (seat + 1) % 4;
+  last = performance.now();
+}
+
+$('start').onclick = () => {
+  const ms = MINS * 60 * 1000;
+  broadcast({ t: 'start', ms });
+  applyStart(ms);
+};
+
+$('tap').onclick = () => {
+  if (active !== me || over) return;       // lockout
+  const remaining = rem[me] - (performance.now() - last);
+  broadcast({ t: 'tap', seat: me, rem: remaining });
+  applyTap(me, remaining);
+  if (navigator.vibrate) navigator.vibrate(30);
+};
+
+// ---------- display ----------
+function current(i) {
+  const t = (i === active && !over) ? rem[i] - (performance.now() - last) : rem[i];
+  return Math.max(0, t);
+}
+
+function fmt(ms) {
+  const s = Math.ceil(ms / 1000);
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function render() {
+  // flag detection: only the owner of the clock declares it
+  if (active === me && !over && current(me) <= 0) {
+    over = true; rem[me] = 0; broadcast({ t: 'flag', seat: me });
+  }
+
+  $('clocks').innerHTML = [0, 1, 2, 3].map(i =>
+    `<div class="clock ${i === active ? 'active' : ''} ${i === me ? 'me' : ''}">
+       <div class="name">Seat ${i + 1}${i === me ? ' (you)' : ''}</div>
+       <div class="time">${active < 0 ? fmt(MINS * 60000) : fmt(current(i))}</div>
+     </div>`).join('');
+
+  $('peers').textContent = `Connected: ${Object.keys(conns).length}/3`;
+  $('start').style.display = active < 0 ? 'block' : 'none';
+
+  const t = $('tap');
+  const myTurn = active === me && !over;
+  t.disabled = !myTurn;
+  t.classList.toggle('mine', myTurn);
+  t.textContent = over ? 'Game over' : active < 0 ? 'Waiting to start…' : myTurn ? 'TAP' : `Seat ${active + 1}'s turn`;
+}
+
+setInterval(() => { if (me !== undefined) render(); }, 100);
+</script>
+</body>
+</html>
