@@ -5,13 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
 <title>4-Player Chess Clock</title>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee;
-         height: 100dvh; display: flex; flex-direction: column; }
+         min-height: 100dvh; display: flex; flex-direction: column; }
   #setup { padding: 24px; display: flex; flex-direction: column; gap: 12px; max-width: 420px; margin: auto; width: 100%; }
   input, select, button { font-size: 18px; padding: 12px; border-radius: 8px; border: 0; }
   button { background: #3b82f6; color: #fff; }
+  button:disabled { background: #333; color: #777; }
+  #showqr { background: #444; }
+  #qrs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; text-align: center; }
+  #qrs img, #qrs canvas { background: #fff; padding: 6px; max-width: 100%; }
   #game { display: none; flex: 1; flex-direction: column; }
   #status { padding: 8px 12px; font-size: 14px; background: #222; display: flex; justify-content: space-between; }
   #clocks { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 8px; }
@@ -20,10 +25,10 @@
   .clock.me .name { color: #60a5fa; }
   .name { font-size: 14px; opacity: .8; }
   .time { font-size: 34px; font-variant-numeric: tabular-nums; }
-  #tap { flex: 1; margin: 8px; font-size: 32px; border-radius: 16px; }
+  #claim, #start { margin: 8px; }
+  #tap { flex: 1; margin: 8px; font-size: 32px; border-radius: 16px; min-height: 120px; }
   #tap:disabled { background: #333; color: #777; }
   #tap.mine { background: #22c55e; }
-  #start { margin: 8px; }
 </style>
 </head>
 <body>
@@ -31,17 +36,16 @@
 <div id="setup">
   <h2>4-Player Chess Clock</h2>
   <input id="room" placeholder="Room code (same on all phones)" autocapitalize="off">
-  <select id="seat">
-    <option value="0">Seat 1</option><option value="1">Seat 2</option>
-    <option value="2">Seat 3</option><option value="3">Seat 4</option>
-  </select>
   <button id="join">Join</button>
+  <button id="showqr">Show seat QR codes</button>
+  <div id="qrs"></div>
 </div>
 
 <div id="game">
   <div id="status"><span id="peers"></span><span id="msg"></span></div>
   <div id="clocks"></div>
-  <button id="start">Start (10 min each)</button>
+  <button id="claim">Claim seat</button>
+  <button id="start">Start</button>
   <button id="tap" disabled>Waiting…</button>
 </div>
 
@@ -49,13 +53,15 @@
 const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const MINS = +params.get('mins') || 10;
+const seatParam = +params.get('seat') || 0;     // 1-4 when joining from a QR link
 
 let me, room, peer;
-const conns = {};            // slot -> DataConnection (networking only)
-let order = [];              // slots in clockwise move order, built by claim taps
-let rem = [0, 0, 0, 0];      // remaining ms, indexed by slot
-let active = -1;             // slot whose turn it is; -1 = not started
-let last = 0;
+const conns = {};                                // slot -> DataConnection (networking only)
+let order = [undefined, undefined, undefined, undefined];  // order[position] = slot, clockwise move order
+let myPos;                                       // my position in move order, once claimed
+let rem = [0, 0, 0, 0];                          // remaining ms, indexed by slot
+let active = -1;                                 // slot whose turn it is; -1 = not started
+let last = 0;                                    // local time the active turn began
 let over = false;
 
 if (params.get('room')) $('room').value = params.get('room');
@@ -72,19 +78,25 @@ function tryJoin(slot) {
   if (slot > 3) { alert('Room is full.'); return; }
   me = slot;
   peer = new Peer(`chessclock-${room}-${me}`);
+
   peer.on('open', () => {
     $('setup').style.display = 'none';
     $('game').style.display = 'flex';
     for (let s = 0; s < 4; s++) if (s !== me) setup(peer.connect(`chessclock-${room}-${s}`), s);
+    if (seatParam) claim(seatParam - 1);          // QR link: claim seat automatically
   });
   peer.on('connection', c => setup(c, +c.peer.slice(-1)));
   peer.on('error', e => {
-    if (e.type === 'unavailable-id') { peer.destroy(); tryJoin(slot + 1); }
+    if (e.type === 'unavailable-id') { peer.destroy(); tryJoin(slot + 1); }  // slot taken, try next
+    // 'peer-unavailable' just means that slot hasn't joined yet; they'll dial us
   });
 }
 
 function setup(c, slot) {
-  c.on('open', () => { conns[slot] = c; });
+  c.on('open', () => {
+    conns[slot] = c;
+    if (myPos !== undefined) c.send({ t: 'claim', slot: me, pos: myPos });  // tell late joiners
+  });
   c.on('data', onMsg);
   c.on('close', () => { delete conns[slot]; });
 }
@@ -92,8 +104,10 @@ function setup(c, slot) {
 function broadcast(m) { Object.values(conns).forEach(c => c.open && c.send(m)); }
 
 // ---------- game logic ----------
+// Each phone owns its own clock: when you tap, you send YOUR remaining time.
+// Everyone else counts the active player's clock down locally from that value.
 function onMsg(m) {
-  if (m.t === 'claim' && !order.includes(m.slot)) order.push(m.slot);
+  if (m.t === 'claim') order[m.pos] = m.slot;
   if (m.t === 'start') applyStart(m.ms);
   if (m.t === 'tap')   applyTap(m.slot, m.rem);
   if (m.t === 'flag')  { rem[m.slot] = 0; over = true; }
@@ -105,15 +119,18 @@ function applyStart(ms) {
 
 function applyTap(slot, remaining) {
   rem[slot] = remaining;
-  active = order[(order.indexOf(slot) + 1) % 4];   // clockwise
+  active = order[(order.indexOf(slot) + 1) % 4];   // next seat clockwise
   last = performance.now();
 }
 
-$('claim').onclick = () => {
-  if (order.includes(me)) return;
-  order.push(me);
-  broadcast({ t: 'claim', slot: me });
-};
+// Seat claiming: by QR link (pos known) or by tapping the button (first empty position)
+function claim(pos) {
+  if (myPos !== undefined) return;
+  if (order[pos] !== undefined) { alert(`Seat ${pos + 1} is already taken.`); return; }
+  myPos = pos; order[pos] = me;
+  broadcast({ t: 'claim', slot: me, pos });
+}
+$('claim').onclick = () => claim(order.findIndex(s => s === undefined));
 
 $('start').onclick = () => {
   const ms = MINS * 60000;
@@ -122,11 +139,27 @@ $('start').onclick = () => {
 };
 
 $('tap').onclick = () => {
-  if (active !== me || over) return;               // lockout
+  if (active !== me || over) return;               // lockout: only the active player
   const remaining = rem[me] - (performance.now() - last);
   broadcast({ t: 'tap', slot: me, rem: remaining });
   applyTap(me, remaining);
   if (navigator.vibrate) navigator.vibrate(30);
+};
+
+// ---------- QR codes (one per seat) ----------
+$('showqr').onclick = () => {
+  const r = $('room').value.trim().toLowerCase();
+  if (!r) { alert('Enter a room code first.'); return; }
+  const base = location.origin + location.pathname;
+  $('qrs').innerHTML = '';
+  for (let s = 1; s <= 4; s++) {
+    const d = document.createElement('div');
+    d.innerHTML = `<div>Seat ${s}</div>`;
+    const q = document.createElement('div');
+    d.appendChild(q);
+    $('qrs').appendChild(d);
+    new QRCode(q, { text: `${base}?room=${encodeURIComponent(r)}&seat=${s}&mins=${MINS}`, width: 140, height: 140 });
+  }
 };
 
 // ---------- display ----------
@@ -141,6 +174,7 @@ function fmt(ms) {
 }
 
 function render() {
+  // flag detection: only the owner of the clock declares it
   if (active === me && !over && current(me) <= 0) {
     over = true; rem[me] = 0; broadcast({ t: 'flag', slot: me });
   }
@@ -148,30 +182,34 @@ function render() {
   const started = active >= 0;
   $('clocks').innerHTML = [0, 1, 2, 3].map(p => {
     const slot = order[p];
-    if (slot === undefined) return `<div class="clock"><div class="name">Seat ${p + 1}</div><div class="time">—</div></div>`;
+    if (slot === undefined) {
+      return `<div class="clock"><div class="name">Seat ${p + 1}</div><div class="time">—</div></div>`;
+    }
     return `<div class="clock ${slot === active ? 'active' : ''} ${slot === me ? 'me' : ''}">
       <div class="name">Seat ${p + 1}${slot === me ? ' (you)' : ''}</div>
       <div class="time">${started ? fmt(current(slot)) : fmt(MINS * 60000)}</div></div>`;
   }).join('');
 
   const connected = Object.keys(conns).length;
+  const n = order.filter(s => s !== undefined).length;
   $('peers').textContent = `Connected: ${connected}/3`;
 
   // claim phase
-  const claimed = order.includes(me);
+  const claimed = myPos !== undefined;
   $('claim').style.display = (!started && !claimed) ? 'block' : 'none';
-  $('claim').textContent = `I'm seat ${order.length + 1} (clockwise)`;
+  $('claim').textContent = `I'm seat ${order.findIndex(s => s === undefined) + 1} (clockwise)`;
 
   $('start').style.display = started ? 'none' : 'block';
-  $('start').disabled = !(order.length === 4 && connected === 3);
+  $('start').disabled = !(n === 4 && connected === 3);
 
   const t = $('tap');
   const myTurn = active === me && !over;
   t.disabled = !myTurn;
   t.classList.toggle('mine', myTurn);
   t.textContent = over ? 'Game over'
-    : !started ? (order.length < 4 ? 'Claim seats clockwise…' : 'Ready to start')
-    : myTurn ? 'TAP' : `Seat ${order.indexOf(active) + 1}'s turn`;
+    : !started ? (n < 4 ? 'Claim seats clockwise…' : 'Ready to start')
+    : myTurn ? 'TAP'
+    : `Seat ${order.indexOf(active) + 1}'s turn`;
 }
 
 setInterval(() => { if (me !== undefined) render(); }, 100);
